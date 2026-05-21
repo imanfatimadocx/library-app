@@ -1,10 +1,44 @@
-from flask import Flask, render_template_string, request, redirect
+from flask import Flask, render_template_string, request, redirect, Response
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import sqlite3
 import os
+import time
 
 app = Flask(__name__)
 DB_PATH = '/data/library.db'
 
+# ── Prometheus metrics ────────────────────────────────────────────────────
+REQUEST_COUNT = Counter(
+    'library_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status']
+)
+REQUEST_LATENCY = Histogram(
+    'library_request_latency_seconds',
+    'HTTP request latency in seconds',
+    ['endpoint']
+)
+BOOKS_TOTAL = Counter(
+    'library_books_added_total',
+    'Total number of books added'
+)
+
+@app.before_request
+def before_request():
+    request.start_time = time.time()
+
+@app.after_request
+def after_request(response):
+    latency = time.time() - request.start_time
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=request.path,
+        status=response.status_code
+    ).inc()
+    REQUEST_LATENCY.labels(endpoint=request.path).observe(latency)
+    return response
+
+# ── Database ──────────────────────────────────────────────────────────────
 def init_db():
     os.makedirs('/data', exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -18,7 +52,6 @@ def init_db():
             status TEXT DEFAULT 'Available'
         )
     ''')
-    # Add sample books if empty
     cursor.execute('SELECT COUNT(*) FROM books')
     if cursor.fetchone()[0] == 0:
         sample_books = [
@@ -35,6 +68,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ── HTML Template ─────────────────────────────────────────────────────────
 HTML = '''
 <!DOCTYPE html>
 <html>
@@ -196,6 +230,7 @@ HTML = '''
 </html>
 '''
 
+# ── Routes ────────────────────────────────────────────────────────────────
 @app.route('/')
 def home():
     init_db()
@@ -208,9 +243,9 @@ def home():
     borrowed = sum(1 for b in books if b[4] == 'Borrowed')
     conn.close()
     return render_template_string(HTML, books=books,
-                                 total=total,
-                                 available=available,
-                                 borrowed=borrowed)
+                                  total=total,
+                                  available=available,
+                                  borrowed=borrowed)
 
 @app.route('/add', methods=['POST'])
 def add_book():
@@ -225,7 +260,16 @@ def add_book():
     )
     conn.commit()
     conn.close()
+    BOOKS_TOTAL.inc()
     return redirect('/')
+
+@app.route('/metrics')
+def metrics():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+@app.route('/health')
+def health():
+    return {'status': 'healthy'}, 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
